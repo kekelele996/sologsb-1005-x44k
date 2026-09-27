@@ -10,8 +10,8 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
-import { WorkbenchService } from './workbench.service'
+import type { Annotation, Claim, Feature, ReviewLine, Role, ValidationIssue, WorkbenchState } from './models'
+import { WorkbenchService, type ImportReviewResult, type ReviewPreviewRow } from './workbench.service'
 
 @Component({
   selector: 'app-root',
@@ -30,6 +30,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   versionDialog = false
   versionName = ''
   activeIssue: ValidationIssue | null = null
+  reviewDraft = 'A|“温湿度数据”是否包括露点等派生数据？建议在从属权利要求中限定。\n2-E|传感器沿对角线布置的数量依据不充分，请补充实施例。\n1-Z|“预测维护”特征在权利要求中缺少上位概括。\nC|请说明通信周期与调节频率之间的配合关系。\nE|多个传感器的校准方式未在权利要求中限定。'
+  reviewScopeCurrent = false
+  reviewImportResult: ImportReviewResult | null = null
+  reviewClaimSelections: Record<string, string> = {}
   roleOptions: Array<{ label: string; value: Role }> = [
     { label: '代理人（可编辑主数据与本人批注）', value: 'author' },
     { label: '审查员（可编辑本人批注）', value: 'examiner' },
@@ -71,12 +75,76 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   get canEditMainData(): boolean { return this.state.role !== 'viewer' }
   get mappedFeatureCount(): number { return this.claimFeatures.filter(feature => feature.supportIds.length > 0).length }
 
+  // 批量核对
+  get reviewLines(): ReviewLine[] { return this.state.reviewLines }
+  get pendingReviewLines(): ReviewLine[] { return this.state.reviewLines.filter(line => line.status === 'pending' && !line.claimedByRole) }
+  get handledReviewLines(): ReviewLine[] { return this.state.reviewLines.filter(line => line.status !== 'pending' || !!line.claimedByRole) }
+  get pendingCount(): number { return this.pendingReviewLines.length }
+  get canImportReview(): boolean { return this.state.role !== 'viewer' && !!this.reviewDraft.trim() }
+  get canUndoReview(): boolean { return this.service.canUndo }
+  get canRedoReview(): boolean { return this.service.canRedo }
+  get undoBlocked(): boolean { return this.service.undoBlockedByRole }
+  get redoBlocked(): boolean { return this.service.redoBlockedByRole }
+  get reviewPreviewRows(): ReviewPreviewRow[] { return this.reviewDraft.trim() ? this.service.previewReviewImport(this.reviewDraft, this.reviewScopeCurrent) : [] }
+
   claimLabel(id: string): string { return this.state.claims.find(item => item.id === id)?.title || '未命名权利要求' }
   featureLabel(id: string): string { return this.state.features.find(item => item.id === id)?.label || id }
   paragraphLabel(id: string): string { return this.state.paragraphs.find(item => item.id === id)?.section || id }
   isMapped(feature: Feature, paragraphId: string): boolean { return feature.supportIds.includes(paragraphId) }
   isOwnAnnotation(annotation: Annotation): boolean { return annotation.authorRole === this.state.role }
   ownerLabel(role: Role): string { return ({ author: '代理人', examiner: '审查员', viewer: '观察者' })[role] }
+
+  reviewFeatureLabel(id: string | null): string { return id ? this.featureLabel(id) : '未匹配特征' }
+  reviewKindLabel(line: ReviewLine): string {
+    if (line.status === 'annotated') return '已生成批注'
+    if (line.status === 'duplicate') return '重复跳过'
+    return line.matchKind === 'ambiguous' ? '歧义待认领' : '未匹配待认领'
+  }
+  reviewCandidates(line: ReviewLine): Feature[] {
+    const byId = (id: string): Feature | undefined => this.state.features.find(feature => feature.id === id)
+    const fromIds = (ids: string[]): Feature[] => ids.map(byId).filter((feature): feature is Feature => !!feature)
+    const matched = fromIds(line.candidateIds)
+    if (matched.length) return matched
+    // 候选已被删除或“对不上”时，列出当前权利要求的全部特征供认领。
+    return this.state.features.filter(feature => feature.claimId === this.state.selectedClaimId)
+  }
+  reviewClaimSelection(line: ReviewLine): string {
+    if (!this.reviewClaimSelections[line.id]) {
+      const preferred = line.candidateIds[0] || this.state.features.find(feature => feature.claimId === this.state.selectedClaimId)?.id || this.state.features[0]?.id || ''
+      this.reviewClaimSelections[line.id] = preferred
+    }
+    return this.reviewClaimSelections[line.id]
+  }
+  setReviewClaimSelection(line: ReviewLine, value: string): void { this.reviewClaimSelections[line.id] = value }
+  canClaim(line: ReviewLine): boolean { return line.status === 'pending' && !line.claimedByRole && this.state.role !== 'viewer' && !!this.reviewClaimSelection(line) }
+  canRelease(line: ReviewLine): boolean {
+    if (this.state.role === 'viewer' || line.status === 'pending') return false
+    return line.importedByRole === this.state.role || line.claimedByRole === this.state.role
+  }
+  canDismiss(line: ReviewLine): boolean {
+    return this.state.role !== 'viewer' && line.status === 'pending' && !line.claimedByRole && line.importedByRole === this.state.role
+  }
+  importReview(): void {
+    this.reviewImportResult = this.service.importReview(this.reviewDraft, this.reviewScopeCurrent)
+    if ((this.reviewImportResult?.imported || 0) > 0) this.reviewDraft = ''
+  }
+  claimLine(line: ReviewLine): void {
+    const featureId = this.reviewClaimSelection(line)
+    if (!featureId) return
+    this.service.claimReviewLine(line.id, featureId)
+    delete this.reviewClaimSelections[line.id]
+  }
+  releaseLine(line: ReviewLine): void { this.service.releaseReviewLine(line.id) }
+  dismissLine(line: ReviewLine): void { this.service.dismissReviewLine(line.id) }
+  jumpToFeature(featureId: string | null): void {
+    if (!featureId) return
+    const feature = this.state.features.find(item => item.id === featureId)
+    if (feature) {
+      this.service.selectClaim(feature.claimId)
+      this.service.selectFeature(featureId)
+      this.service.setTab('mapping')
+    }
+  }
 
   updateClaimField(field: 'title' | 'text' | 'number' | 'independent', event: Event): void {
     const element = event.target as HTMLInputElement

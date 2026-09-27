@@ -34,6 +34,24 @@ export interface Annotation {
   updatedAt: string
 }
 
+export type ReviewMatchKind = 'auto' | 'not-found' | 'ambiguous'
+export type ReviewLineStatus = 'pending' | 'annotated' | 'duplicate'
+
+export interface ReviewLine {
+  id: string
+  ref: string
+  comment: string
+  matchKind: ReviewMatchKind
+  status: ReviewLineStatus
+  featureId: string | null
+  candidateIds: string[]
+  annotationId: string | null
+  importedByRole: Role
+  claimedByRole: Role | null
+  createdAt: string
+  updatedAt: string
+}
+
 export interface OrphanMapping {
   id: string
   featureLabel: string
@@ -61,6 +79,7 @@ export interface WorkbenchState {
   paragraphs: Paragraph[]
   features: Feature[]
   annotations: Annotation[]
+  reviewLines: ReviewLine[]
   orphanMappings: OrphanMapping[]
   versions: ClaimVersion[]
   role: Role

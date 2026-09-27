@@ -7,8 +7,8 @@
     </div>
     <div class="top-actions">
       <span class="save-state">浏览器本地自动保存</span>
-      <p-button label="撤销" icon="pi pi-undo" severity="secondary" [outlined]="true" [disabled]="!history.past" (onClick)="service.undo()" pTooltip="Ctrl / ⌘ + Z"></p-button>
-      <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" [disabled]="!history.future" (onClick)="service.redo()" pTooltip="Ctrl / ⌘ + Shift + Z"></p-button>
+      <p-button label="撤销" icon="pi pi-undo" severity="secondary" [outlined]="true" [disabled]="!canUndoReview" (onClick)="service.undo()" [pTooltip]="undoBlocked ? '最近步骤属于另一角色，切换角色后可撤销' : 'Ctrl / ⌘ + Z'"></p-button>
+      <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" [disabled]="!canRedoReview" (onClick)="service.redo()" [pTooltip]="redoBlocked ? '最近步骤属于另一角色，切换角色后可重做' : 'Ctrl / ⌘ + Shift + Z'"></p-button>
       <p-button label="保存版本" icon="pi pi-save" (onClick)="versionDialog = true" pTooltip="Ctrl / ⌘ + S"></p-button>
     </div>
   </header>
@@ -54,6 +54,7 @@
 
       <nav class="tabs" aria-label="工作台视图">
         <button [class.active]="state.activeTab === 'mapping'" (click)="service.setTab('mapping')"><i class="pi pi-sitemap"></i>特征映射</button>
+        <button [class.active]="state.activeTab === 'review'" (click)="service.setTab('review')"><i class="pi pi-inbox"></i>批量核对<span class="tab-badge" *ngIf="pendingCount">{{ pendingCount }}</span></button>
         <button [class.active]="state.activeTab === 'claim'" (click)="service.setTab('claim')"><i class="pi pi-file-edit"></i>权利要求录入</button>
         <button [class.active]="state.activeTab === 'compare'" (click)="service.setTab('compare')"><i class="pi pi-arrows-h"></i>版本比较</button>
         <button [class.active]="state.activeTab === 'audit'" (click)="service.setTab('audit')"><i class="pi pi-check-square"></i>核对清单</button>
@@ -133,7 +134,7 @@
           <div class="panel-heading"><span>特征批注</span><span class="permission-note"><i class="pi pi-lock"></i>仅可编辑本人批注</span></div>
           <div class="annotation-list">
             <article class="annotation" *ngFor="let annotation of featureAnnotations" [class.own]="isOwnAnnotation(annotation)">
-              <header><strong>{{ annotation.authorName }}</strong><time>{{ annotation.updatedAt | date:'MM-dd HH:mm' }}</time></header>
+              <header><strong>{{ annotation.authorName }}<span class="bulk-chip" *ngIf="annotation.id.startsWith('annotation-review-')">批量核对</span></strong><time>{{ annotation.updatedAt | date:'MM-dd HH:mm' }}</time></header>
               <textarea pTextarea [value]="annotation.text" [readonly]="!isOwnAnnotation(annotation)" (change)="updateAnnotation(annotation, $event)"></textarea>
               <p-button *ngIf="isOwnAnnotation(annotation)" label="删除" icon="pi pi-trash" severity="danger" [text]="true" size="small" (onClick)="service.deleteAnnotation(annotation.id)"></p-button>
             </article>
@@ -143,6 +144,84 @@
             <textarea pTextarea rows="2" placeholder="以{{ state.role === 'author' ? '代理人' : state.role === 'examiner' ? '审查员' : '观察者' }}身份补充批注…" [(ngModel)]="annotationDraft"></textarea>
             <p-button label="添加批注" icon="pi pi-comment" [disabled]="!annotationDraft.trim()" (onClick)="addAnnotation()"></p-button>
           </div>
+        </section>
+      </div>
+
+      <div class="view" *ngIf="state.activeTab === 'review'">
+        <div class="review-layout">
+          <section class="panel review-import">
+            <div class="panel-heading"><span>粘贴审查意见</span><span class="status-chip ready">逐行识别</span></div>
+            <p class="hint">每行格式：<code>特征编号|意见正文</code>。编号支持 <code>A</code>、<code>1-A</code>、<code>权2-E</code> 等写法；能唯一对应到当前权利要求的特征时直接生成本人批注，重复内容自动跳过，对不上或有歧义的行进入待认领区。</p>
+            <textarea pTextarea rows="9" placeholder="A|请补充温湿度数据的具体参数范围。&#10;2-E|对角线布置的数量依据不足。" [(ngModel)]="reviewDraft" [disabled]="state.role === 'viewer'"></textarea>
+            <label class="check-row standalone scope-row"><input type="checkbox" [(ngModel)]="reviewScopeCurrent">仅在当前权利要求（{{ selectedClaim.number }}）内匹配编号</label>
+            <div class="review-preview" *ngIf="reviewPreviewRows.length">
+              <div class="preview-head"><strong>识别预览</strong><span>{{ reviewPreviewRows.length }} 行</span></div>
+              <div class="preview-row" *ngFor="let row of reviewPreviewRows" [class.auto]="row.matchKind === 'auto' && !row.duplicateAnnotationId" [class.dup]="!!row.duplicateAnnotationId" [class.pending]="row.matchKind !== 'auto' || !!row.duplicateAnnotationId">
+                <i class="pi" [class.pi-check-circle]="row.matchKind === 'auto' && !row.duplicateAnnotationId" [class.pi-copy]="!!row.duplicateAnnotationId" [class.pi-question-circle]="row.matchKind === 'ambiguous'" [class.pi-times-circle]="row.matchKind === 'not-found' && !row.duplicateAnnotationId"></i>
+                <div>
+                  <strong>第 {{ row.line }} 行 · {{ row.ref }}</strong>
+                  <small *ngIf="row.invalid">格式无效：必须包含“|”且编号与意见均不为空，该行不会导入。</small>
+                  <small *ngIf="!row.invalid && row.matchKind === 'auto' && !row.duplicateAnnotationId">→ 唯一匹配 {{ featureLabel(row.featureId!) }}，将生成为{{ state.role === 'examiner' ? '审查员' : '代理人' }}批注</small>
+                  <small *ngIf="!row.invalid && !!row.duplicateAnnotationId">→ 与该特征上本人已有批注重复，将跳过</small>
+                  <small *ngIf="!row.invalid && row.matchKind === 'ambiguous'">→ 编号存在 {{ row.candidateIds.length }} 个候选，进入待认领区</small>
+                  <small *ngIf="!row.invalid && row.matchKind === 'not-found' && !row.duplicateAnnotationId">→ 当前权利要求中找不到对应特征，进入待认领区</small>
+                </div>
+              </div>
+            </div>
+            <div class="review-actions">
+              <p-button label="批量导入并生成批注" icon="pi pi-send" [disabled]="!canImportReview" (onClick)="importReview()" />
+              <span class="import-result" *ngIf="reviewImportResult">已导入 {{ reviewImportResult.imported }} 行：生成 {{ reviewImportResult.annotated }}，重复跳过 {{ reviewImportResult.duplicate }}，待认领 {{ reviewImportResult.pending }}</span>
+            </div>
+            <div class="review-history-actions">
+              <p-button label="撤销导入/认领" icon="pi pi-undo" severity="secondary" [outlined]="true" size="small" [disabled]="!canUndoReview" (onClick)="service.undo()" />
+              <p-button label="重做" icon="pi pi-redo" severity="secondary" [outlined]="true" size="small" [disabled]="!canRedoReview" (onClick)="service.redo()" />
+              <span class="hint block-tip" *ngIf="undoBlocked || redoBlocked"><i class="pi pi-lock"></i>最近的{{ undoBlocked ? '撤销' : '重做' }}步骤属于另一角色，切换回该角色后可用；共享操作（如特征编辑）随时可撤销。</span>
+            </div>
+          </section>
+
+          <section class="panel review-pending">
+            <div class="panel-heading"><span>待认领区</span><p-badge [value]="pendingCount" severity="warn" /></div>
+            <p class="hint">代理人或审查员选定目标特征后认领，即生成本人批注。切换角色后不能认领、丢弃他人导入的待处理项。</p>
+            <article class="review-card pending" *ngFor="let line of pendingReviewLines">
+              <header>
+                <span class="review-ref">{{ line.ref }}</span>
+                <span class="review-chip" [class.ambiguous]="line.matchKind === 'ambiguous'">{{ line.matchKind === 'ambiguous' ? '歧义' : '未匹配' }}</span>
+                <span class="review-by">来自：{{ ownerLabel(line.importedByRole) }}</span>
+              </header>
+              <p class="review-comment">{{ line.comment }}</p>
+              <div class="claim-row">
+                <select [value]="reviewClaimSelection(line)" (change)="setReviewClaimSelection(line, $any($event.target).value)" [disabled]="state.role === 'viewer'">
+                  <option *ngFor="let candidate of reviewCandidates(line)" [value]="candidate.id">{{ claimLabel(candidate.claimId) }} · {{ candidate.label }}</option>
+                </select>
+                <p-button label="认领并批注" icon="pi pi-check" size="small" [disabled]="!canClaim(line)" (onClick)="claimLine(line)" />
+                <p-button label="丢弃" icon="pi pi-trash" severity="danger" [text]="true" size="small" [disabled]="!canDismiss(line)" pTooltip="仅导入者可丢弃" (onClick)="dismissLine(line)" />
+              </div>
+            </article>
+            <div *ngIf="!pendingReviewLines.length" class="empty-success"><i class="pi pi-check-circle"></i><span>没有待认领的审查意见。</span></div>
+          </section>
+        </div>
+
+        <section class="panel review-done">
+          <div class="panel-heading"><span>已处理意见</span><span class="heading-actions"><p-badge [value]="handledReviewLines.length" severity="success" /></span></div>
+          <div class="review-table-wrap">
+            <table class="review-table">
+              <thead><tr><th>特征编号</th><th>意见</th><th>目标特征</th><th>状态</th><th>归属</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr *ngFor="let line of handledReviewLines">
+                  <td class="cell-ref">{{ line.ref }}</td>
+                  <td class="cell-comment">{{ line.comment }}</td>
+                  <td><button type="button" class="link-btn" [disabled]="!line.featureId" (click)="jumpToFeature(line.featureId)">{{ line.featureId ? reviewFeatureLabel(line.featureId) : '—' }}</button></td>
+                  <td><span class="review-state" [class.annotated]="line.status === 'annotated'" [class.duplicate]="line.status === 'duplicate'">{{ reviewKindLabel(line) }}</span></td>
+                  <td class="cell-owner">{{ ownerLabel(line.claimedByRole || line.importedByRole) }}<small *ngIf="line.claimedByRole && line.claimedByRole !== line.importedByRole">（{{ ownerLabel(line.importedByRole) }}导入）</small></td>
+                  <td>
+                    <p-button icon="pi pi-arrow-circle-right" [text]="true" size="small" pTooltip="定位到特征批注" [disabled]="!line.featureId" (onClick)="jumpToFeature(line.featureId)" />
+                    <p-button label="撤回" icon="pi pi-undo" severity="warn" [text]="true" size="small" [disabled]="!canRelease(line)" pTooltip="本人可撤回，批注删除后行回到待认领区" (onClick)="releaseLine(line)" />
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div *ngIf="!handledReviewLines.length" class="empty-state">导入后，已生成批注或重复跳过的行在此留痕，处理状态随浏览器本地保存。</div>
         </section>
       </div>
 
