@@ -1,9 +1,11 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, ReviewOpinion, Role, UnmatchedReason, ValidationIssue, WorkbenchState } from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
+
+export const ROLE_NAMES: Record<Role, string> = { author: '代理人 · 陈昊', examiner: '审查员 · 李岚', viewer: '观察者' }
 
 const initialClaims: Claim[] = [
   { id: 'claim-1', number: 1, title: '一种自适应展柜环境控制装置', independent: true, text: '一种自适应展柜环境控制装置，包括：柜体；环境传感模块，设置于所述柜体内并用于采集温湿度数据；以及控制模块，与所述环境传感模块通信，并根据所述温湿度数据调节所述柜体的微环境。' },
@@ -29,14 +31,37 @@ const initialAnnotations: Annotation[] = [
   { id: 'annotation-1', featureId: 'feature-b', authorRole: 'examiner', authorName: '审查员 · 李岚', text: '“温湿度数据”是否包括露点等派生数据？建议在从属权利要求中限定。', updatedAt: '2026-09-24T03:10:00.000Z' },
   { id: 'annotation-2', featureId: 'feature-d', authorRole: 'author', authorName: '代理人 · 陈昊', text: '[0024] 已支持分级调节，发布前补充除湿单元与通信模块的连接关系。', updatedAt: '2026-09-24T04:05:00.000Z' }
 ]
+const initialReviewOpinions: ReviewOpinion[] = [
+  { id: 'review-demo-1', ref: '7', opinion: '请说明特征编号 7 对应的技术内容，当前权利要求中未找到该特征。', ownerRole: 'examiner', ownerName: '审查员 · 李岚', status: 'pending', reason: 'unmatched', candidateIds: [], featureId: null, annotationId: null, createdAt: '2026-09-25T01:20:00.000Z' }
+]
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, orphanMappings: [], reviewOpinions: initialReviewOpinions, versions: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+
+/** 归一化特征编号：去空白/常见前缀/间隔符，转大写，使 “特征B”“b”“B.”“B · 柜体” 等价。 */
+function normalizeRef(value: string): string {
+  return value
+    .replace(/^(?:技术)?特征(?:编号)?\s*/i, '')
+    .replace(/[\s.．。·•・:：、（）()\[\]【】]/g, '')
+    .toUpperCase()
+}
+
+function featureMatchKeys(feature: Feature): Set<string> {
+  const keys = new Set<string>()
+  const labelPrefix = feature.label.split('·')[0].trim()
+  if (labelPrefix) keys.add(normalizeRef(labelPrefix))
+  keys.add(normalizeRef(feature.label))
+  return keys
+}
+
+function sameText(a: string, b: string): boolean {
+  return a.replace(/\s+/g, '') === b.replace(/\s+/g, '')
+}
 
 @Injectable({ providedIn: 'root' })
 export class WorkbenchService implements OnDestroy {
@@ -52,6 +77,7 @@ export class WorkbenchService implements OnDestroy {
   readonly paragraphs$ = this.state$.pipe(map(state => state.paragraphs))
   readonly features$ = this.state$.pipe(map(state => state.features))
   readonly annotations$ = this.state$.pipe(map(state => state.annotations))
+  readonly reviewOpinions$ = this.state$.pipe(map(state => state.reviewOpinions))
   readonly role$ = this.state$.pipe(map(state => state.role))
   readonly selectedClaim$ = this.state$.pipe(map(state => state.claims.find(claim => claim.id === state.selectedClaimId) || state.claims[0]))
   readonly selectedFeature$ = this.state$.pipe(map(state => state.features.find(feature => feature.id === state.selectedFeatureId) || null))
@@ -166,6 +192,15 @@ export class WorkbenchService implements OnDestroy {
         if (item.parentId === id) item.parentId = null
       })
       state.annotations = state.annotations.filter(item => item.featureId !== id)
+      state.reviewOpinions.forEach(review => {
+        review.candidateIds = review.candidateIds.filter(candidateId => candidateId !== id)
+        if (review.featureId === id) {
+          review.status = 'pending'
+          review.featureId = null
+          review.annotationId = null
+          review.reason = !review.ref ? 'no-ref' : review.candidateIds.length ? 'ambiguous' : 'unmatched'
+        }
+      })
       state.selectedFeatureId = state.features.find(item => item.claimId === state.selectedClaimId)?.id || null
     })
   }
@@ -190,9 +225,9 @@ export class WorkbenchService implements OnDestroy {
     const trimmed = text.trim()
     if (!trimmed) return
     const role = this.stateSubject.value.role
-    const names: Record<Role, string> = { author: '代理人 · 陈昊', examiner: '审查员 · 李岚', viewer: '观察者' }
+    if (role === 'viewer') return
     this.commit(state => state.annotations.push({
-      id: `annotation-${Date.now()}`, featureId, authorRole: role, authorName: names[role], text: trimmed, updatedAt: new Date().toISOString()
+      id: `annotation-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, featureId, authorRole: role, authorName: ROLE_NAMES[role], text: trimmed, updatedAt: new Date().toISOString()
     }))
   }
 
@@ -207,6 +242,135 @@ export class WorkbenchService implements OnDestroy {
     this.commit(state => {
       const annotation = state.annotations.find(item => item.id === id)
       if (annotation && annotation.authorRole === state.role) state.annotations = state.annotations.filter(item => item.id !== id)
+    })
+  }
+
+  /**
+   * 批量导入审查意见。每行格式：特征编号|意见正文。
+   * 唯一命中特征 → 以当前角色直接生成批注；对不上或多义 → 进入本人待认领区。
+   * 同角色、同特征、同意见的内容不重复生成。
+   */
+  importReview(raw: string): { auto: number; pending: number; duplicate: number } {
+    const role = this.stateSubject.value.role
+    if (role === 'viewer') return { auto: 0, pending: 0, duplicate: 0 }
+    const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    if (!lines.length) return { auto: 0, pending: 0, duplicate: 0 }
+    let auto = 0
+    let pending = 0
+    let duplicate = 0
+    this.commit(state => {
+      const now = Date.now()
+      lines.forEach((line, index) => {
+        const split = line.match(/^([^|｜│]+)[|｜│]([\s\S]+)$/)
+        const ref = split ? split[1].trim() : ''
+        const opinion = (split ? split[2] : line).trim()
+        if (!opinion) return
+
+        let candidates: Feature[] = []
+        let reason: UnmatchedReason = 'no-ref'
+        if (ref) {
+          const key = normalizeRef(ref)
+          const matches = state.features.filter(feature => featureMatchKeys(feature).has(key))
+          const inClaim = matches.filter(feature => feature.claimId === state.selectedClaimId)
+          // 唯一对应当前权利要求中的特征，直接命中；当前权项无匹配时退而全局唯一生效。
+          if (inClaim.length === 1) {
+            candidates = inClaim
+          } else if (inClaim.length > 1) {
+            candidates = inClaim
+            reason = 'ambiguous'
+          } else if (matches.length === 1) {
+            candidates = matches
+          } else if (matches.length > 1) {
+            candidates = matches
+            reason = 'ambiguous'
+          } else {
+            reason = 'unmatched'
+          }
+        }
+
+        const isDuplicate = (featureId: string): boolean =>
+          state.annotations.some(a => a.featureId === featureId && a.authorRole === role && sameText(a.text, opinion)) ||
+          state.reviewOpinions.some(r => r.ownerRole === role && r.featureId === featureId && sameText(r.opinion, opinion))
+
+        if (candidates.length === 1 && reason !== 'ambiguous') {
+          const feature = candidates[0]
+          if (isDuplicate(feature.id)) { duplicate++; return }
+          const annotationId = `annotation-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`
+          state.annotations.push({
+            id: annotationId, featureId: feature.id, authorRole: role, authorName: ROLE_NAMES[role],
+            text: opinion, updatedAt: new Date(now + index).toISOString()
+          })
+          state.reviewOpinions.push({
+            id: `review-${now}-${index}`, ref, opinion, ownerRole: role, ownerName: ROLE_NAMES[role],
+            status: 'resolved', reason: null, candidateIds: [feature.id], featureId: feature.id,
+            annotationId, createdAt: new Date(now + index).toISOString()
+          })
+          auto++
+        } else {
+          if (candidates.some(feature => isDuplicate(feature.id))) { duplicate++; return }
+          state.reviewOpinions.push({
+            id: `review-${now}-${index}`, ref, opinion, ownerRole: role, ownerName: ROLE_NAMES[role],
+            status: 'pending', reason, candidateIds: candidates.map(feature => feature.id), featureId: null,
+            annotationId: null, createdAt: new Date(now + index).toISOString()
+          })
+          pending++
+        }
+      })
+    })
+    return { auto, pending, duplicate }
+  }
+
+  /** 认领待处理意见：本人把意见指向某个特征，并以本人身份生成批注。 */
+  claimReview(id: string, featureId: string): void {
+    const role = this.stateSubject.value.role
+    if (role === 'viewer') return
+    this.commit(state => {
+      const review = state.reviewOpinions.find(item => item.id === id)
+      if (!review || review.status !== 'pending' || review.ownerRole !== role) return
+      const feature = state.features.find(item => item.id === featureId)
+      if (!feature) return
+      if (
+        state.annotations.some(a => a.featureId === featureId && a.authorRole === role && sameText(a.text, review.opinion)) ||
+        state.reviewOpinions.some(r => r.id !== id && r.ownerRole === role && r.featureId === featureId && r.status === 'resolved' && sameText(r.opinion, review.opinion))
+      ) return
+      const now = Date.now()
+      const annotationId = `annotation-${now}-${Math.random().toString(36).slice(2, 7)}`
+      state.annotations.push({
+        id: annotationId, featureId, authorRole: role, authorName: ROLE_NAMES[role],
+        text: review.opinion, updatedAt: new Date(now).toISOString()
+      })
+      review.status = 'resolved'
+      review.reason = null
+      review.featureId = featureId
+      review.annotationId = annotationId
+      review.candidateIds = Array.from(new Set([...review.candidateIds, featureId]))
+    })
+  }
+
+  /** 撤回已处理意见：退回本人待认领区，并删除由批量核对生成的对应批注。 */
+  withdrawReview(id: string): void {
+    const role = this.stateSubject.value.role
+    this.commit(state => {
+      const review = state.reviewOpinions.find(item => item.id === id)
+      if (!review || review.status !== 'resolved' || review.ownerRole !== role) return
+      if (review.annotationId) state.annotations = state.annotations.filter(item => item.id !== review.annotationId)
+      review.status = 'pending'
+      review.annotationId = null
+      const key = review.ref ? normalizeRef(review.ref) : ''
+      const candidates = key ? state.features.filter(feature => featureMatchKeys(feature).has(key)) : []
+      review.candidateIds = candidates.map(feature => feature.id)
+      review.reason = !review.ref ? 'no-ref' : candidates.length ? 'ambiguous' : 'unmatched'
+      review.featureId = null
+    })
+  }
+
+  /** 放弃（删除）本人的待认领意见。 */
+  discardReview(id: string): void {
+    const role = this.stateSubject.value.role
+    this.commit(state => {
+      const review = state.reviewOpinions.find(item => item.id === id)
+      if (!review || review.status !== 'pending' || review.ownerRole !== role) return
+      state.reviewOpinions = state.reviewOpinions.filter(item => item.id !== id)
     })
   }
 
@@ -227,6 +391,17 @@ export class WorkbenchService implements OnDestroy {
       state.features = clone(version.features)
       if (!state.claims.some(claim => claim.id === state.selectedClaimId)) state.selectedClaimId = state.claims[0]?.id || ''
       state.selectedFeatureId = state.features.find(feature => feature.claimId === state.selectedClaimId)?.id || null
+      const featureIds = new Set(state.features.map(feature => feature.id))
+      state.annotations = state.annotations.filter(annotation => featureIds.has(annotation.featureId))
+      state.reviewOpinions.forEach(review => {
+        review.candidateIds = review.candidateIds.filter(id => featureIds.has(id))
+        if (review.featureId && !featureIds.has(review.featureId)) {
+          review.status = 'pending'
+          review.featureId = null
+          review.annotationId = null
+          review.reason = !review.ref ? 'no-ref' : review.candidateIds.length ? 'ambiguous' : 'unmatched'
+        }
+      })
     })
   }
 

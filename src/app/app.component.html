@@ -54,6 +54,7 @@
 
       <nav class="tabs" aria-label="工作台视图">
         <button [class.active]="state.activeTab === 'mapping'" (click)="service.setTab('mapping')"><i class="pi pi-sitemap"></i>特征映射</button>
+        <button [class.active]="state.activeTab === 'review'" (click)="service.setTab('review')"><i class="pi pi-inbox"></i>批量核对<span *ngIf="pendingReviewCount" class="tab-badge">{{ pendingReviewCount }}</span></button>
         <button [class.active]="state.activeTab === 'claim'" (click)="service.setTab('claim')"><i class="pi pi-file-edit"></i>权利要求录入</button>
         <button [class.active]="state.activeTab === 'compare'" (click)="service.setTab('compare')"><i class="pi pi-arrows-h"></i>版本比较</button>
         <button [class.active]="state.activeTab === 'audit'" (click)="service.setTab('audit')"><i class="pi pi-check-square"></i>核对清单</button>
@@ -143,6 +144,89 @@
             <textarea pTextarea rows="2" placeholder="以{{ state.role === 'author' ? '代理人' : state.role === 'examiner' ? '审查员' : '观察者' }}身份补充批注…" [(ngModel)]="annotationDraft"></textarea>
             <p-button label="添加批注" icon="pi pi-comment" [disabled]="!annotationDraft.trim()" (onClick)="addAnnotation()"></p-button>
           </div>
+        </section>
+      </div>
+
+      <div class="view" *ngIf="state.activeTab === 'review'">
+        <section class="panel review-import">
+          <div class="panel-heading">
+            <span>批量导入审查意见</span>
+            <span class="permission-note"><i class="pi pi-lock"></i>每行“特征编号|意见”，批注以当前角色生成</span>
+          </div>
+          <p class="hint">
+            将整段审查意见按行粘贴：编号能唯一对应到当前案件中的特征时，自动生成{{ state.role === 'author' ? '代理人' : '审查员' }}批注（重复内容跳过）；
+            对不上或存在多义的行自动进入下方待认领区。支持 A、特征B、a、A · 柜体 等写法，分隔符支持 | ｜ │。
+          </p>
+          <textarea pTextarea rows="6" class="review-textarea" placeholder="例如：&#10;B|请说明温湿度数据是否包含露点等派生数据。&#10;特征F|补充除湿单元与控制模块的连接关系。&#10;9|该编号在权利要求中未找到。" [(ngModel)]="reviewInput" [disabled]="!canEditMainData"></textarea>
+          <div class="review-import-actions">
+            <p-button label="开始核对" icon="pi pi-check-double" [disabled]="!reviewInput.trim() || !canEditMainData" (onClick)="importReviews()" />
+            <span class="hint" *ngIf="state.role === 'viewer'">观察者为只读角色，不能导入或认领意见。</span>
+          </div>
+          <div *ngIf="reviewSummary as summary" class="review-summary" role="status">
+            <span class="chip success"><i class="pi pi-check-circle"></i>自动生成批注 {{ summary.auto }} 条</span>
+            <span class="chip warning"><i class="pi pi-inbox"></i>进入待认领 {{ summary.pending }} 行</span>
+            <span class="chip muted" *ngIf="summary.duplicate"><i class="pi pi-copy"></i>重复跳过 {{ summary.duplicate }} 行</span>
+          </div>
+        </section>
+
+        <section class="panel review-pending">
+          <div class="panel-heading">
+            <span>待认领区</span>
+            <p-badge [value]="pendingReviews.length + ' 行'" [severity]="pendingReviews.length ? 'warn' : 'success'" />
+          </div>
+          <p class="hint">待认领项归导入角色所有：切换角色后只能查看，不能替对方认领或放弃；认领后即以本人身份生成批注。</p>
+          <div class="review-row" *ngFor="let review of pendingReviews">
+            <div class="review-main">
+              <div class="review-meta">
+                <span class="review-ref">{{ review.ref || '（无编号）' }}</span>
+                <span class="owner-chip">{{ ownerLabel(review.ownerRole) }}</span>
+                <span class="chip warning"><i class="pi pi-question-circle"></i>{{ reviewReasonLabel(review) }}</span>
+                <span class="chip locked" *ngIf="!isOwnReview(review)"><i class="pi pi-lock"></i>对方待认领，只读</span>
+              </div>
+              <p class="review-opinion">{{ review.opinion }}</p>
+              <div class="review-candidates" *ngIf="reviewCandidates(review).length">
+                <small>疑似特征：</small>
+                <span *ngFor="let candidate of reviewCandidates(review)">{{ featureOptionLabel(candidate) }}</span>
+              </div>
+            </div>
+            <div class="review-actions" *ngIf="isOwnReview(review) && canEditMainData; else readonlyActions">
+              <select [value]="selectedOptionFor(review)" (change)="onClaimSelect(review, $event)">
+                <ng-container *ngFor="let claim of state.claims">
+                  <optgroup label="权利要求 {{ claim.number }} · {{ claim.title }}">
+                    <option *ngFor="let feature of reviewOptions(review)" [value]="feature.id" [hidden]="feature.claimId !== claim.id">{{ feature.label }}</option>
+                  </optgroup>
+                </ng-container>
+              </select>
+              <p-button label="认领并批注" icon="pi pi-comment" size="small" (onClick)="claimReview(review)" />
+              <p-button label="放弃" icon="pi pi-trash" severity="danger" [text]="true" size="small" (onClick)="service.discardReview(review.id)" pTooltip="撤销/重做可恢复" />
+            </div>
+            <ng-template #readonlyActions>
+              <div class="review-actions-readonly"><i class="pi pi-lock"></i><span>{{ state.role === 'viewer' ? '观察者不可操作' : '仅' + ownerLabel(review.ownerRole) + '可认领' }}</span></div>
+            </ng-template>
+          </div>
+          <div *ngIf="!pendingReviews.length" class="empty-success"><i class="pi pi-check-circle"></i><span>没有待认领的意见。</span></div>
+        </section>
+
+        <section class="panel review-resolved">
+          <div class="panel-heading">
+            <span>已生成批注</span>
+            <p-badge [value]="resolvedReviews.length + ' 条'" severity="secondary" />
+          </div>
+          <div class="review-row resolved" *ngFor="let review of resolvedReviews">
+            <div class="review-main">
+              <div class="review-meta">
+                <span class="review-ref">{{ review.ref || '（无编号）' }}</span>
+                <span class="owner-chip">{{ ownerLabel(review.ownerRole) }}</span>
+                <span class="chip success"><i class="pi pi-check-circle"></i>{{ reviewFeature(review) ? featureOptionLabel(reviewFeature(review)!) : '对应特征已删除' }}</span>
+              </div>
+              <p class="review-opinion">{{ review.opinion }}</p>
+            </div>
+            <div class="review-actions">
+              <p-button label="定位批注" icon="pi pi-arrow-right" [text]="true" size="small" [disabled]="!reviewFeature(review)" (onClick)="locateReview(review)" />
+              <p-button *ngIf="isOwnReview(review)" label="撤回到待认领" icon="pi pi-undo" severity="warn" [outlined]="true" size="small" (onClick)="service.withdrawReview(review.id)" pTooltip="删除对应批注并退回待认领，可撤销" />
+            </div>
+          </div>
+          <div *ngIf="!resolvedReviews.length" class="empty-state">导入后唯一命中的意见会在这里生成批注记录。</div>
         </section>
       </div>
 

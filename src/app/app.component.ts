@@ -10,7 +10,7 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, Feature, ReviewOpinion, Role, ValidationIssue, WorkbenchState } from './models'
 import { WorkbenchService } from './workbench.service'
 
 @Component({
@@ -27,6 +27,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   compareA = ''
   compareB = ''
   annotationDraft = ''
+  reviewInput = ''
+  reviewSummary: { auto: number; pending: number; duplicate: number } | null = null
+  claimSelections: Record<string, string> = {}
   versionDialog = false
   versionName = ''
   activeIssue: ValidationIssue | null = null
@@ -70,6 +73,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   get warningCount(): number { return this.issues.filter(item => item.severity === 'warning').length }
   get canEditMainData(): boolean { return this.state.role !== 'viewer' }
   get mappedFeatureCount(): number { return this.claimFeatures.filter(feature => feature.supportIds.length > 0).length }
+  get pendingReviews(): ReviewOpinion[] {
+    return [...this.state.reviewOpinions]
+      .filter(item => item.status === 'pending')
+      .sort((a, b) => Number(b.ownerRole === this.state.role) - Number(a.ownerRole === this.state.role) || a.createdAt.localeCompare(b.createdAt))
+  }
+  get resolvedReviews(): ReviewOpinion[] {
+    return this.state.reviewOpinions.filter(item => item.status === 'resolved').sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  }
+  get pendingReviewCount(): number { return this.state.reviewOpinions.filter(item => item.status === 'pending').length }
 
   claimLabel(id: string): string { return this.state.claims.find(item => item.id === id)?.title || '未命名权利要求' }
   featureLabel(id: string): string { return this.state.features.find(item => item.id === id)?.label || id }
@@ -77,6 +89,67 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   isMapped(feature: Feature, paragraphId: string): boolean { return feature.supportIds.includes(paragraphId) }
   isOwnAnnotation(annotation: Annotation): boolean { return annotation.authorRole === this.state.role }
   ownerLabel(role: Role): string { return ({ author: '代理人', examiner: '审查员', viewer: '观察者' })[role] }
+
+  reviewReasonLabel(review: ReviewOpinion): string {
+    if (review.reason === 'no-ref') return '缺少“特征编号|意见”分隔符'
+    if (review.reason === 'unmatched') return `未找到编号“${review.ref}”对应的特征`
+    return `编号“${review.ref}”对应多个特征，请指定`
+  }
+
+  isOwnReview(review: ReviewOpinion): boolean { return review.ownerRole === this.state.role }
+
+  reviewCandidates(review: ReviewOpinion): Feature[] {
+    return review.candidateIds
+      .map(id => this.state.features.find(feature => feature.id === id))
+      .filter((feature): feature is Feature => !!feature)
+  }
+
+  /** 待认领行的可选项：多义时为候选集，否则为当前案件全部特征。 */
+  reviewOptions(review: ReviewOpinion): Feature[] {
+    const candidates = this.reviewCandidates(review)
+    if (candidates.length > 1) return candidates
+    return this.state.features
+  }
+
+  selectedOptionFor(review: ReviewOpinion): string {
+    if (this.claimSelections[review.id]) return this.claimSelections[review.id]
+    const candidates = this.reviewCandidates(review)
+    const preferred = candidates.find(feature => feature.claimId === this.state.selectedClaimId) || candidates[0]
+    if (preferred) return preferred.id
+    return this.state.features.find(feature => feature.claimId === this.state.selectedClaimId)?.id || ''
+  }
+
+  onClaimSelect(review: ReviewOpinion, event: Event): void {
+    this.claimSelections[review.id] = (event.target as HTMLSelectElement).value
+  }
+
+  featureOptionLabel(feature: Feature): string {
+    const claim = this.state.claims.find(item => item.id === feature.claimId)
+    return `权${claim?.number ?? '?'} · ${feature.label}`
+  }
+
+  reviewFeature(review: ReviewOpinion): Feature | undefined {
+    return review.featureId ? this.state.features.find(feature => feature.id === review.featureId) : undefined
+  }
+
+  importReviews(): void {
+    this.reviewSummary = this.service.importReview(this.reviewInput)
+    this.reviewInput = ''
+  }
+
+  claimReview(review: ReviewOpinion): void {
+    const featureId = this.claimSelections[review.id] || this.selectedOptionFor(review)
+    if (featureId) this.service.claimReview(review.id, featureId)
+  }
+
+  locateReview(review: ReviewOpinion): void {
+    if (!review.featureId) return
+    const feature = this.state.features.find(item => item.id === review.featureId)
+    if (!feature) return
+    this.service.selectClaim(feature.claimId)
+    this.service.selectFeature(feature.id)
+    this.service.setTab('mapping')
+  }
 
   updateClaimField(field: 'title' | 'text' | 'number' | 'independent', event: Event): void {
     const element = event.target as HTMLInputElement

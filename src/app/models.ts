@@ -56,12 +56,30 @@ export interface Position {
   scrollY: number
 }
 
+export type ReviewStatus = 'pending' | 'resolved'
+export type UnmatchedReason = 'no-ref' | 'unmatched' | 'ambiguous'
+
+export interface ReviewOpinion {
+  id: string
+  ref: string
+  opinion: string
+  ownerRole: Role
+  ownerName: string
+  status: ReviewStatus
+  reason: UnmatchedReason | null
+  candidateIds: string[]
+  featureId: string | null
+  annotationId: string | null
+  createdAt: string
+}
+
 export interface WorkbenchState {
   claims: Claim[]
   paragraphs: Paragraph[]
   features: Feature[]
   annotations: Annotation[]
   orphanMappings: OrphanMapping[]
+  reviewOpinions: ReviewOpinion[]
   versions: ClaimVersion[]
   role: Role
   selectedClaimId: string
